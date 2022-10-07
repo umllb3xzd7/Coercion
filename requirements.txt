@@ -1,0 +1,1 @@
+impacket>=0.9.19.dev0             ; python_version >= '3'
